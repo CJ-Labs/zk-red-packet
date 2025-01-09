@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "./interfaces/IRedPacketVerifier.sol";
-import "./interfaces/IPoseidon.sol";
+import "./libraries/Poseidon.sol";
 
-contract RedPacket is ReentrancyGuard {
+contract RedPacket is ReentrancyGuard, Pausable, Ownable {
     // 红包状态
-    enum Status { PENDING, ACTIVE, FINISHED }
+    enum Status { PENDING, ACTIVE, FINISHED, EXPIRED }
     
     // 红包类型
     enum PacketType { FIXED, RANDOM }
@@ -23,6 +25,8 @@ contract RedPacket is ReentrancyGuard {
         PacketType packetType; // 红包类型
         Status status;       // 状态
         bytes32 merkleRoot;  // 默克尔树根
+        uint256 createdAt;   // 创建时间
+        uint256 expiresAt;   // 过期时间
     }
     
     // 存储所有红包
@@ -30,37 +34,78 @@ contract RedPacket is ReentrancyGuard {
     uint256 public packetCounter;
     
     // 验证器合约
-    IRedPacketVerifier public verifier;
+    IRedPacketVerifier public immutable verifier;
+    Poseidon public immutable poseidon;
     
-    // 添加 Poseidon 哈希合约
-    IPoseidon public poseidon;
+    // 常量
+    uint256 public constant MAX_COUNT = 100;        // 最大红包数量
+    uint256 public constant MIN_AMOUNT = 1e15;      // 最小金额 (0.001 ETH)
+    uint256 public constant MAX_DURATION = 7 days;  // 最长有效期
     
     // 事件
-    event PacketCreated(uint256 indexed packetId, address creator, uint256 amount, uint256 count);
-    event PacketClaimed(uint256 indexed packetId, address claimer, uint256 amount);
+    event PacketCreated(
+        uint256 indexed packetId,
+        address indexed creator,
+        uint256 amount,
+        uint256 count,
+        PacketType packetType
+    );
+    event PacketClaimed(
+        uint256 indexed packetId,
+        address indexed claimer,
+        uint256 amount
+    );
+    event PacketExpired(uint256 indexed packetId, uint256 remainingAmount);
+    event PacketRefunded(uint256 indexed packetId, uint256 amount);
     
-    constructor(address _verifier, address _poseidon) {
+    constructor(
+        address _verifier,
+        address _poseidon
+    ) Ownable(msg.sender) {
+        require(_verifier != address(0), "Invalid verifier");
+        require(_poseidon != address(0), "Invalid poseidon");
         verifier = IRedPacketVerifier(_verifier);
-        poseidon = IPoseidon(_poseidon);
+        poseidon = Poseidon(_poseidon);
     }
     
     // 创建固定金额红包
     function createFixedPacket(
         uint256 count,
         uint256 amountPerPacket,
-        bytes32 merkleRoot
-    ) external payable returns (uint256) {
+        bytes32 merkleRoot,
+        uint256 duration
+    ) external payable whenNotPaused returns (uint256) {
+        require(count > 0 && count <= MAX_COUNT, "Invalid count");
+        require(amountPerPacket >= MIN_AMOUNT, "Amount too small");
+        require(duration > 0 && duration <= MAX_DURATION, "Invalid duration");
         require(msg.value == count * amountPerPacket, "Invalid total amount");
-        return _createPacket(PacketType.FIXED, count, msg.value, merkleRoot);
+        
+        return _createPacket(
+            PacketType.FIXED,
+            count,
+            msg.value,
+            merkleRoot,
+            duration
+        );
     }
     
     // 创建随机金额红包
     function createRandomPacket(
         uint256 count,
-        bytes32 merkleRoot
-    ) external payable returns (uint256) {
-        require(msg.value > count, "Amount too small");
-        return _createPacket(PacketType.RANDOM, count, msg.value, merkleRoot);
+        bytes32 merkleRoot,
+        uint256 duration
+    ) external payable whenNotPaused returns (uint256) {
+        require(count > 0 && count <= MAX_COUNT, "Invalid count");
+        require(msg.value >= count * MIN_AMOUNT, "Amount too small");
+        require(duration > 0 && duration <= MAX_DURATION, "Invalid duration");
+        
+        return _createPacket(
+            PacketType.RANDOM,
+            count,
+            msg.value,
+            merkleRoot,
+            duration
+        );
     }
     
     // 内部创建红包函数
@@ -68,7 +113,8 @@ contract RedPacket is ReentrancyGuard {
         PacketType packetType,
         uint256 count,
         uint256 totalAmount,
-        bytes32 merkleRoot
+        bytes32 merkleRoot,
+        uint256 duration
     ) internal returns (uint256) {
         uint256 packetId = ++packetCounter;
         
@@ -80,10 +126,19 @@ contract RedPacket is ReentrancyGuard {
             remainingCount: count,
             packetType: packetType,
             status: Status.ACTIVE,
-            merkleRoot: merkleRoot
+            merkleRoot: merkleRoot,
+            createdAt: block.timestamp,
+            expiresAt: block.timestamp + duration
         });
         
-        emit PacketCreated(packetId, msg.sender, totalAmount, count);
+        emit PacketCreated(
+            packetId,
+            msg.sender,
+            totalAmount,
+            count,
+            packetType
+        );
+        
         return packetId;
     }
     
@@ -93,18 +148,18 @@ contract RedPacket is ReentrancyGuard {
         bytes32[] calldata merkleProof,
         IRedPacketVerifier.Proof calldata zkProof,
         string calldata password
-    ) external nonReentrant {
+    ) external nonReentrant whenNotPaused {
         Packet storage packet = packets[packetId];
         require(packet.status == Status.ACTIVE, "Packet not active");
         require(packet.remainingCount > 0, "Packet empty");
+        require(block.timestamp < packet.expiresAt, "Packet expired");
         
         // 使用 Poseidon 计算密码哈希
-        uint256[] memory inputs = new uint256[](3);
+        uint256[2] memory inputs;
         inputs[0] = uint256(uint160(msg.sender));
-        inputs[1] = uint256(keccak256(abi.encodePacked(password)));
-        inputs[2] = packetId;
+        inputs[1] = uint256(keccak256(abi.encodePacked(password, packetId)));
         
-        uint256 poseidonHash = poseidon.poseidon(inputs);
+        uint256 poseidonHash = poseidon.hash(inputs);
         
         // 验证默克尔证明
         bytes32 leaf = bytes32(poseidonHash);
@@ -138,32 +193,66 @@ contract RedPacket is ReentrancyGuard {
     }
     
     // 计算领取金额
-    function _calculateClaimAmount(Packet storage packet) internal view returns (uint256) {
+    function _calculateClaimAmount(
+        Packet storage packet
+    ) internal view returns (uint256) {
         if (packet.packetType == PacketType.FIXED) {
             return packet.totalAmount / packet.count;
-        } else {
-            // 随机金额算法
-            uint256 remaining = packet.remainingAmount;
-            uint256 count = packet.remainingCount;
-            
-            if (count == 1) {
-                return remaining;
-            }
-            
-            // 使用区块信息作为随机源
-            uint256 rand = uint256(
-                keccak256(
-                    abi.encodePacked(
-                        block.timestamp,
-                        block.prevrandao,
-                        msg.sender
-                    )
-                )
-            );
-            
-            // 确保每个人至少能获得1wei
-            uint256 max = remaining - count + 1;
-            return (rand % max) + 1;
         }
+        
+        uint256 remaining = packet.remainingAmount;
+        uint256 count = packet.remainingCount;
+        
+        if (count == 1) {
+            return remaining;
+        }
+        
+        // 使用更安全的随机数生成方式
+        uint256 rand = uint256(
+            keccak256(
+                abi.encodePacked(
+                    block.timestamp,
+                    block.prevrandao,
+                    msg.sender,
+                    packet.creator,
+                    packet.createdAt
+                )
+            )
+        );
+        
+        // 确保每个人至少能获得最小金额
+        uint256 minAmount = MIN_AMOUNT;
+        uint256 maxAmount = remaining - (count - 1) * minAmount;
+        
+        return minAmount + (rand % (maxAmount - minAmount + 1));
+    }
+    
+    // 过期红包退回
+    function refundExpiredPacket(
+        uint256 packetId
+    ) external nonReentrant {
+        Packet storage packet = packets[packetId];
+        require(packet.status == Status.ACTIVE, "Packet not active");
+        require(block.timestamp >= packet.expiresAt, "Packet not expired");
+        require(msg.sender == packet.creator, "Not creator");
+        
+        uint256 remainingAmount = packet.remainingAmount;
+        packet.remainingAmount = 0;
+        packet.status = Status.EXPIRED;
+        
+        (bool success, ) = packet.creator.call{value: remainingAmount}("");
+        require(success, "Transfer failed");
+        
+        emit PacketExpired(packetId, remainingAmount);
+    }
+    
+    // 紧急暂停
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    // 恢复
+    function unpause() external onlyOwner {
+        _unpause();
     }
 } 
